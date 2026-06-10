@@ -1,231 +1,235 @@
 import sys
-# 에러 방지용 코드
+import math
+
 try:
     import pkg_resources
 except ImportError:
     import pip._vendor.pkg_resources as pkg_resources
     sys.modules['pkg_resources'] = pkg_resources
 
-
-
-
 from vpython import *
-import math
 
 # =====================================================================
-# 1. 실제 실험용 물리 파라미터 및 유리구슬 설정
+# 1. 물리 파라미터 및 시스템 고도화 상수 설정
 # =====================================================================
-g = 9.81              # 중력 가속도 (m/s²)
-h_offset = 0.05       # 트랙을 지면에서 띄울 높이 (5cm)
-z_gap = 0.04          # 레일 충돌을 막기 위해 옆으로 비껴낼 간격 (4cm)
+g = 9.81              
+R_loop = 0.1          # 루프 반지름 (m)
 
-# 유리구슬 (Glass Marble) 설정 — 무게 10g 기준
-m = 0.010              
-rho_glass = 2500       
-V_ball = m / rho_glass 
-R_ball = (V_ball / ((4/3) * math.pi))**(1/3)  
+# 시스템 전체 고도 제어 오프셋 설정 (요청사항: 바닥과 레일 8cm 이격)
+ELEVATION_Y = 0.08    
 
-a = 0.18              # 사이클로이드 반경 (18cm) -> 시작 높이 H = 36cm
-s_ramp_end = 4 * a    
+# [변경] 쇠구슬(Steel Ball) 재질 및 역학 설정
+D_ball = 0.015        
+R_ball = D_ball / 2 
+rho_steel = 7850      # 강철 밀도 반영 (7850 kg/m³)
+V_ball = (4/3) * math.pi * R_ball**3
+m = rho_steel * V_ball  
 
-# 클로소이드 루프 파라미터 정의 (물방울 모양 제어)
-R_top = 0.07          # 루프 꼭대기에서의 최소 곡률 반지름 (7cm)
-R_base = 0.25         # 루프 진입/진출부에서의 최대 곡률 반지름 (25cm)
-s_loop_len = 0.70     # 루프 전체 곡선 길이 (약 70cm)
+# 구체의 유효 관성 질량을 반영한 회전 인자 (M_eff = 7/5 * m)
+ROLL_FACTOR = 5.0 / 7.0 
 
-s_loop_end = s_ramp_end + s_loop_len
+# 레일 정밀 치수 및 구름 마찰 계수
+w_rail = 0.012        
+mu_r   = 0.0015       
+
+# 공기 저항 계수 및 유체역학 파라미터 (질량이 커져서 k_drag 값이 유리일 때보다 감소함)
+C_d     = 0.47        
+rho_air = 1.225       
+A       = math.pi * R_ball**2 
+k_drag  = 0.5 * rho_air * C_d * A / m 
+
+# 사이클로이드(Cycloid) 최속강하선 궤도 파라미터 
+R_cycloid = 0.15             # 사이클로이드 생성원 반지름 (m)
+L_drop = 4 * R_cycloid       # 드롭 구간 총 호의 길이 (m)
+L_loop = 2 * math.pi * R_loop              
 L_exit = 0.3          
-s_max = s_loop_end + L_exit
-
-ROLL_FACTOR = 5.0 / 7.0  
-w_rail = 0.012         # 레일 간격 12mm
-mu_r   = 0.005         
-
-C_d     = 0.47         
-rho_air = 1.225        
-A       = math.pi * R_ball**2           
-k_drag  = 0.5 * rho_air * C_d * A / m  
+S_MAX = L_loop + L_exit 
 
 # =====================================================================
-# 2. 클로소이드 궤적 테이블 미리 생성
+# 2. 궤도 기하학 수치 해석 함수 (물리-시각 좌표계 분리 설계)
 # =====================================================================
-N_samples = 1000
-loop_profile = []
-current_pos = vector(0, h_offset, 0)
-current_theta = 0.0  
-
-ds_sample = s_loop_len / N_samples
-for i in range(N_samples + 1):
-    s_l = i * ds_sample
-    ratio = s_l / s_loop_len
-    
-    if ratio <= 0.5:
-        k = (1.0/R_base) + ((1.0/R_top) - (1.0/R_base)) * (ratio * 2)
+def track_info(s):
+    """ 궤도 내 임의의 위치 s에서의 경사각(theta)과 곡률(kappa)을 반환 """
+    if s < 0:
+        val = -s / L_drop
+        val = max(0.0, min(1.0, val)) 
+        
+        alpha = math.asin(s / L_drop) 
+        sin_half = math.sqrt(1.0 - val**2)
+        
+        if sin_half > 1e-4:
+            kappa = 1.0 / (L_drop * sin_half)
+        else:
+            kappa = 0.0 
+        return alpha, kappa
+    elif s <= L_loop:
+        return s / R_loop, 1.0 / R_loop
     else:
-        k = (1.0/R_top) - ((1.0/R_top) - (1.0/R_base)) * ((ratio - 0.5) * 2)
-        
-    loop_profile.append((vec(current_pos.x, current_pos.y, current_pos.z), current_theta, k))
-    
-    current_theta += k * ds_sample
-    current_pos += vector(math.cos(current_theta), math.sin(current_theta), 0) * ds_sample
-    current_pos.z = - z_gap * (s_l / s_loop_len)
+        return 0.0, 0.0
 
-# 최종 생성된 클로소이드 루프의 끝점 저장
-loop_end_pos = vec(loop_profile[-1][0].x, loop_profile[-1][0].y, loop_profile[-1][0].z)
-
-# =====================================================================
-# 2-1. 트랙 기하학 함수 (에러 수정 버전)
-# =====================================================================
-def get_track_geometry(s):
-    # 변수 초기화로 UnboundLocalError 원천 차단
-    track_pos = vector(0,0,0)
-    tangent = vector(1,0,0)
-    normal = vector(0,1,0)
-    curvature = 0.0
-
-    if s <= s_ramp_end:
-        # 1. 사이클로이드 하강 경사면
-        s_clamp = max(1e-5, min(s, s_ramp_end - 1e-5))
-        phi = 2 * math.acos(1 - s_clamp / (4 * a))
-        x = a * (phi - math.sin(phi)) - a * math.pi
-        y = a * (1 + math.cos(phi)) + h_offset
-        track_pos = vector(x, y, 0)
+def get_pos(s):
+    """ 물리적 이격(8cm)을 기하학 방정식에 주입하여 3D 위치 벡터 연산 """
+    if s < 0:
+        val = -s / L_drop
+        val = max(0.0, min(1.0, val))
+        theta = 2 * math.acos(val)
         
-        sin_half = math.sin(phi / 2)
-        cos_half = math.cos(phi / 2)
-        tangent = vector(sin_half, -cos_half, 0)
-        normal = vector(cos_half, sin_half, 0)
-        curvature = 1.0 / (4 * a * sin_half)
-        
-    elif s <= s_loop_end:
-        # 2. 클로소이드 루프 구간 (변수명 명확히 매칭)
-        s_loop = s - s_ramp_end
-        idx = min(int((s_loop / s_loop_len) * N_samples), N_samples)
-        
-        # loop_profile에서 꺼내온 위치 값을 track_pos에 정확히 대입합니다.
-        p_profile, theta, curvature = loop_profile[idx]
-        track_pos = vec(p_profile.x, p_profile.y, p_profile.z)
-        
-        dx_ds = math.cos(theta)
-        dy_ds = math.sin(theta)
-        dz_ds = - z_gap / s_loop_len
-        tangent = hat(vector(dx_ds, dy_ds, dz_ds))
-        normal = hat(vector(-math.sin(theta), math.cos(theta), 0))
-        
+        x = R_cycloid * (theta - math.pi - math.sin(theta))
+        y = R_cycloid * (1 + math.cos(theta)) + ELEVATION_Y  # 고도 8cm 적용
+        z = 0.0
+        return vector(x, y, z)
+    elif s <= L_loop:
+        x = R_loop * math.sin(s / R_loop)
+        y = R_loop * (1 - math.cos(s / R_loop)) + ELEVATION_Y # 고도 8cm 적용
+        z = 0.04 * (s / L_loop) 
+        return vector(x, y, z)
     else:
-        # 3. 직선 탈출 구간
-        s_exit = s - s_loop_end
-        track_pos = loop_end_pos + vector(s_exit, 0, 0)
-        tangent = vector(1, 0, 0)
-        normal = vector(0, 1, 0)
-        curvature = 0.0
-        
-    return track_pos, tangent, normal, curvature
+        s_exit = s - L_loop
+        x = s_exit
+        y = 0 + ELEVATION_Y                                  # 고도 8cm 적용
+        z = 0.04 
+        return vector(x, y, z)
 
 # =====================================================================
-# 3. VPython 3D 시각화 환경 구축
+# 3. VPython 3D 그래픽스 및 시각화 환경 렌더링
 # =====================================================================
-scene = canvas(title='<b>Real Clothoid(Teardrop) Loop Roller Coaster Simulation</b>',
-               width=900, height=500,
-               center=vector(-a*math.pi/2 + 0.1, a, -z_gap/2),
-               background=color.black)
-scene.forward = vector(0.2, -0.15, -0.9)
+scene = canvas(title='<b>3D Realistic Coaster (Steel Ball Model - 8cm Elevated)</b>',
+               width=900, height=550,
+               center=vector(0.05, R_loop + ELEVATION_Y, 0), background=vector(0.1, 0.1, 0.12))
+scene.forward = vector(0.3, -0.3, -1) 
+scene.ambient = color.gray(0.4) 
 
-ground = box(pos=vector(-a*math.pi/2 + 0.2, -0.0025, -z_gap/2), size=vector(1.8, 0.005, 0.5), color=vector(0.2, 0.2, 0.2))
+# 궤도 스플라인 포인트 생성
+pts_front, pts_back = [], []
+for s_val in arange(-L_drop, S_MAX + 0.01, 0.005):
+    pos = get_pos(s_val)
+    pts_front.append(pos + vector(0, -R_ball, w_rail/2))
+    pts_back.append(pos + vector(0, -R_ball, -w_rail/2))
 
-rail_left = curve(radius=0.002, color=vector(0.9, 0.4, 0.1), shininess=0.8)
-rail_right = curve(radius=0.002, color=vector(0.9, 0.4, 0.1), shininess=0.8)
-for i in range(600):
-    s_t = (s_max * i) / 599
-    pos_t, _, _, _ = get_track_geometry(s_t)
-    rail_left.append(pos_t + vector(0, 0, w_rail/2))
-    rail_right.append(pos_t + vector(0, 0, -w_rail/2))
+# 가이드 레일 시각화
+rail_color = vector(0.5, 0.5, 0.55)
+rail_front_curve = curve(pos=pts_front, radius=0.0015, color=rail_color, shininess=0.9)
+rail_back_curve  = curve(pos=pts_back, radius=0.0015, color=rail_color, shininess=0.9)
 
-# 구조물 지지대 배치
-cylinder(pos=vector(-a*math.pi, 0, 0), axis=vector(0, 2*a + h_offset, 0), radius=0.005, color=vector(0.5, 0.5, 0.5))
-cylinder(pos=vector(0, 0, 0), axis=vector(0, h_offset, 0), radius=0.005, color=vector(0.5, 0.5, 0.5))
-cylinder(pos=vector(loop_end_pos.x, 0, -z_gap), axis=vector(0, loop_end_pos.y, 0), radius=0.005, color=vector(0.5, 0.5, 0.5))
+# 트랙 침목(Cross-ties) 구조물 배치
+for i in range(0, len(pts_front), 8): 
+    cylinder(pos=pts_back[i], axis=pts_front[i]-pts_back[i], 
+             radius=0.0008, color=vector(0.25, 0.25, 0.25))
 
-ball = sphere(pos=vector(0, 0, 0), radius=R_ball,
-              color=vector(0.4, 0.7, 1.0), opacity=0.7, shininess=1.0,
-              make_trail=True, trail_color=color.green, trail_radius=0.001)
+# 스타팅 플랫폼 및 지지 타워
+start_pos = get_pos(-L_drop)
+box(pos=start_pos + vector(-0.02, 0, 0), size=vector(0.04, 0.01, 0.04), color=vector(0.4, 0.4, 0.4), shininess=0.8)
+cylinder(pos=vector(start_pos.x, ELEVATION_Y/2, 0), axis=vector(0, start_pos.y - ELEVATION_Y/2, 0), radius=0.003, color=color.gray(0.3))
 
-info_label = label(pos=vector(-a*math.pi/2, 2*a + h_offset + 0.05, 0), text='', height=12, font='monospace')
+# [변경] 쇠구슬 오브젝트 생성 (은빛 금속 질감, 불꽃 같은 주황색 트레일)
+ball = sphere(pos=start_pos, radius=R_ball, 
+              color=vector(0.8, 0.8, 0.85), opacity=1.0, shininess=1.0, 
+              make_trail=True, trail_color=color.orange, trail_radius=0.0008)
+
+# 기준 지면(Ground Plane) 생성 (레일 시스템과 정확히 8cm 단차 유지)
+ground = box(pos=vector(0.1, -R_ball - 0.01 + ELEVATION_Y, 0.02), size=vector(1.5, 0.01, 0.5), color=vector(0.2, 0.2, 0.2))
+
+# 정보 디스플레이 패널
+info_label = label(pos=vector(0, 2.5*R_loop + ELEVATION_Y, 0), text='', height=12, border=4,
+                   font='monospace', color=color.white, background=color.black, opacity=0.8)
+
+# 실시간 분석 그래프 윈도우 생성 (0.01초 주기)
+graph_win = graph(title="Steel Ball Velocity vs Time (Sampled at 0.01s)", xtitle="Time (s)", ytitle="Velocity (m/s)", width=900, height=250)
+v_curve = gcurve(color=color.orange, label="Instantaneous Velocity", graph=graph_win)
 
 # =====================================================================
-# 4. 수치 해석 및 시뮬레이션 실행 (무한 반복 및 포물선 추락 내장)
+# 4. 물리 동역학 연산 (Runge-Kutta 4th Order) 및 상태 관리 시스템
 # =====================================================================
 def f_v(s, v):
-    pos, tangent, normal, curvature = get_track_geometry(s)
-    g_vec = vector(0, -g, 0)
-    g_t = g_vec.dot(tangent)
-    g_n = g_vec.dot(normal)
-    
-    a_n = (v**2) * curvature
-    N = m * (a_n - g_n)
-    
+    theta, kappa = track_info(s)
+    N = m * (v**2 * kappa + g * math.cos(theta))
     f_roll = mu_r * max(N, 0.0)
     sign_v = (1 if v > 0 else -1) if v != 0 else 0
-    a_raw = g_t - (f_roll / m) * sign_v - k_drag * v**2 * sign_v
+    a_raw = -g * math.sin(theta) - (f_roll / m) * sign_v - k_drag * v**2 * sign_v
     return ROLL_FACTOR * a_raw
 
 def update_rk4(s, v, dt):
-    k1_s = v; k1_v = f_v(s, v)
-    k2_s = v + k1_v * dt / 2; k2_v = f_v(s + k1_s * dt / 2, v + k1_v * dt / 2)
-    k3_s = v + k2_v * dt / 2; k3_v = f_v(s + k2_s * dt / 2, v + k2_v * dt / 2)
-    s_next_half = min(s + k2_s * dt / 2, s_max - 1e-5)
-    k4_s = v + k3_v * dt; k4_v = f_v(s_next_half, v + k3_v * dt)
-    return s + (dt/6)*(k1_s + 2*k2_s + 2*k3_s + k4_s), v + (dt/6)*(k1_v + 2*k2_v + 2*k3_v + k4_v)
+    k1_s = v
+    k1_v = f_v(s, v)
+    k2_s = v + k1_s*dt/2
+    k2_v = f_v(s + k1_s*dt/2, v + k1_v*dt/2)
+    k3_s = v + k2_s*dt/2
+    k3_v = f_v(s + k2_s*dt/2, v + k2_v*dt/2)
+    k4_s = v + k3_v*dt
+    k4_v = f_v(s + k3_s*dt, v + k3_v*dt)
 
-s = 0.002; v = 0.0; dt = 0.001; t = 0.0
-trial_count = 1
-is_falling = False       
-vel_3d = vector(0, 0, 0)  
+    new_s = s + (dt / 6) * (k1_s + 2*k2_s + 2*k3_s + k4_s)
+    new_v = v + (dt / 6) * (k1_v + 2*k2_v + 2*k3_v + k4_v)
+    return new_s, new_v
 
+# 초기 제어 변수 선언
+s, v, t, N_now = -L_drop, 0.0, 0.0, 0.0
+dt = 0.001                       # 초정밀 물리 연산 타임스텝 (1ms)
+step_count = 0                   # 이산 데이터 플로팅 카운터
+sim_state = 'running' 
+
+def on_mouse_click(_):
+    global sim_state, s, v, t, N_now, step_count
+    if sim_state == 'running':
+        sim_state = 'paused'
+        info_label.text += '\n\n[일시정지 중 - 다시 클릭하여 재생]'
+    elif sim_state == 'paused':
+        sim_state = 'running'
+    elif sim_state in ['finished', 'failed']:
+        s, v, t, N_now = -L_drop, 0.0, 0.0, 0.0
+        step_count = 0           # 시스템 리셋 시 스텝 카운터 동기화 초기화
+        v_curve.data = []      
+        ball.clear_trail()     
+        sim_state = 'running'
+
+scene.bind('click', on_mouse_click)
+scene.append_to_caption('\n\n마우스 클릭 시 일시정지 되며, 동작 종료 후 클릭하면 시스템이 초기화됩니다.')
+
+# 기준선 대비 초기 위치 역학적 에너지 보존 검증용 상수 연산
+initial_pos = get_pos(-L_drop)
+E_initial = m * g * (initial_pos.y - ELEVATION_Y) 
+
+# =====================================================================
+# 5. 데시메이션(Decimation) 필터 기반 메인 루프
+# =====================================================================
 while True:
-    rate(150)
+    rate(300) 
     
-    if is_falling:
-        t += dt
-        speed_3d = mag(vel_3d)
-        drag_acc_3d = - k_drag * speed_3d * vel_3d if speed_3d > 0 else vector(0,0,0)
-        acc_3d = vector(0, -g, 0) + drag_acc_3d
-        vel_3d += acc_3d * dt
-        ball.pos += vel_3d * dt
-        
-        if ball.pos.y <= R_ball:
-            ball.pos.y = R_ball  
-            info_label.text = f'Trial: #{trial_count}\nZone: 💥 CRASHED!\nSpeed: {mag(vel_3d):.3f} m/s'
-            sleep(1.5)           
-            s = 0.002; v = 0.0; t = 0.0
-            trial_count += 1
-            is_falling = False
-            ball.clear_trail()
-            continue
-    else:
-        s, v = update_rk4(s, v, dt)
-        t += dt
-        
-        if s >= s_max - 0.005:
-            s = 0.002; v = 0.0; trial_count += 1
-            ball.clear_trail()
-            continue
-            
-        pos_now, tangent_now, normal_now, curvature_now = get_track_geometry(s)
-        ball.pos = pos_now
-        
-        a_n_now = (v**2) * curvature_now
-        g_n_now = vector(0, -g, 0).dot(normal_now)
-        N_now = m * (a_n_now - g_n_now)
-        
-        if s_ramp_end < s < s_loop_end:
-            if N_now < 0 and ball.pos.y > (h_offset + R_top):
-                is_falling = True
-                vel_3d = v * tangent_now 
-                continue
-                
-        zone = "1. Cycloid Ramp" if s <= s_ramp_end else ("2. Clothoid Loop" if s <= s_loop_end else "3. Exit Straight")
-        info_label.text = (f'Trial: #{trial_count}\n'
-                           f'Zone: {zone}\n'
-                           f'Speed: {v:.3f} m/s\n'
-                           f'Normal Force: {N_now:.4f} N')
+    if sim_state != 'running':
+        continue
+
+    # 초정밀 물리 해석 코어 업데이트 (dt = 0.001s)
+    s, v = update_rk4(s, v, dt)
+    t += dt
+    step_count += 1              # 연산 스텝 수 적산
+
+    theta, kappa = track_info(s)
+    N_now = m * (v**2 * kappa + g * math.cos(theta))
+
+    ball.pos = get_pos(s)
+    
+    # 10스텝(0.001초 * 10 = 0.01초)마다 그래프에 데이터 적재
+    if step_count % 10 == 0:
+        v_curve.plot(t, v)
+
+    # 역학적 에너지 보존 법칙 실시간 수치 분석 시스템
+    E_k = 0.5 * (m / ROLL_FACTOR) * v**2                  # 회전 관성이 포함된 운동 에너지
+    E_p = m * g * (ball.pos.y - ELEVATION_Y)               # 기준면 보정 위치 에너지
+    E_total = E_k + E_p
+    energy_loss_pct = ((E_initial - E_total) / E_initial) * 100 if E_initial > 0 else 0
+
+    info_label.text = (f't = {t:.3f} s\n'
+                       f'Pos = {s:.3f} m\n'
+                       f'v = {v:.3f} m/s\n'
+                       f'N = {N_now:.4f} N\n'
+                       f'Energy Loss = {energy_loss_pct:.1f}%')
+
+    # 이탈 조건 검증 로직
+    if kappa > 0 and N_now < 0 and math.cos(theta) < 0:
+        sim_state = 'failed'
+        info_label.text += '\n\n[궤도 이탈! 임계 수직항력 도달 실패]'
+
+    # 완주 조건 검증 로직
+    if s >= S_MAX:
+        sim_state = 'finished'
+        info_label.text += '\n\n[완주 성공! 실시간 연산 데이터 기록 완료]'
